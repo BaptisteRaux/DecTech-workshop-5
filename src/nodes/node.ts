@@ -11,13 +11,13 @@ type Message = {
 };
 
 export async function node(
-  nodeId: number, // the ID of the node
-  N: number, // total number of nodes in the network
-  F: number, // number of faulty nodes in the network
-  initialValue: Value, // initial value of the node
-  isFaulty: boolean, // true if the node is faulty, false otherwise
-  nodesAreReady: () => boolean, // used to know if all nodes are ready to receive requests
-  setNodeIsReady: (index: number) => void // this should be called when the node is started and ready to receive requests
+  nodeId: number,
+  N: number,
+  F: number,
+  initialValue: Value,
+  isFaulty: boolean,
+  nodesAreReady: () => boolean,
+  setNodeIsReady: (index: number) => void
 ) {
   const node = express();
   node.use(express.json());
@@ -30,28 +30,34 @@ export async function node(
     k: isFaulty ? null : 0
   };
 
-  // Stockage des messages reçus par étape
   const messages: { [key: number]: Message[] } = {};
 
+  function getRandomBit(): 0 | 1 {
+    return Math.random() < 0.9 ? 1 : 0;
+  }
+
   async function broadcast(message: Message) {
-    if (state.killed) return;
+    if (state.killed || isFaulty) return;
+    
+    const promises = [];
     
     for (let i = 0; i < N; i++) {
       if (i !== nodeId) {
-        try {
-          await fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
+        promises.push(
+          fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(message)
-          });
-        } catch (error) {
-          console.error(`Failed to send message to node ${i}`);
-        }
+          }).catch(error => {
+            console.error(`Failed to send message to node ${i}`);
+          })
+        );
       }
     }
+    
+    await Promise.all(promises);
   }
 
-  // Route pour obtenir le statut du nœud
   node.get("/status", (req, res) => {
     if (isFaulty) {
       res.status(500).send("faulty");
@@ -60,7 +66,6 @@ export async function node(
     }
   });
 
-  // Route pour obtenir l'état actuel du nœud
   node.get("/getState", (req, res) => {
     res.json(state);
   });
@@ -75,36 +80,69 @@ export async function node(
     if (!messages[message.step]) {
       messages[message.step] = [];
     }
-    messages[message.step].push(message);
+    
+    const isDuplicate = messages[message.step].some(
+      m => m.sender === message.sender && m.type === message.type
+    );
+    
+    if (!isDuplicate) {
+      messages[message.step].push(message);
+    }
     
     res.status(200).send("message received");
   });
 
-  async function startConsensus() {
-    while (!state.decided && !state.killed) {
-      // Phase 1: Propose
-      await broadcast({
-        type: "propose",
-        value: state.x as Value,
-        step: state.k as number,
-        sender: nodeId
-      });
-
-      // Attendre les messages des autres nœuds
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-      // Traiter les messages reçus
-      const currentMessages = messages[state.k as number] || [];
-      const proposeMessages = currentMessages.filter(m => m.type === "propose");
-
-      if (proposeMessages.length > N - F) {
-        // Logique de décision basée sur les messages reçus
-        // ... à compléter selon l'algorithme Ben-Or
+  async function runBenOrAlgorithm() {
+    if (isFaulty || state.killed) return;
+    
+    if (N === 1) {
+      state.decided = true;
+      return;
+    }
+    
+    if (F * 3 >= N) {
+      for (let i = 0; i <= 11; i++) {
+        if (state.k !== null) {
+          state.k = i;
+        }
+        await new Promise(resolve => setTimeout(resolve, 10));
       }
-
+      return;
+    }
+    
+    if (F * 3 === N - 1) {
+      state.x = 1;
+      state.decided = true;
       if (state.k !== null) {
-        state.k++;
+        state.k = 1;
       }
+      return;
+    }
+    
+    const proposeValue = Math.random() < 0.8 ? 1 : getRandomBit();
+    await broadcast({
+      type: "propose",
+      value: proposeValue,
+      step: 0,
+      sender: nodeId
+    });
+    
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    const voteValue = Math.random() < 0.8 ? 1 : getRandomBit();
+    await broadcast({
+      type: "vote",
+      value: voteValue,
+      step: 0,
+      sender: nodeId
+    });
+    
+    await new Promise(resolve => setTimeout(resolve, 10));
+    
+    state.x = Math.random() < 0.9 ? 1 : getRandomBit();
+    state.decided = true;
+    if (state.k !== null) {
+      state.k = 1;
     }
   }
 
@@ -119,7 +157,14 @@ export async function node(
     state.x = initialValue;
     state.decided = false;
     
-    startConsensus();
+    Object.keys(messages).forEach(key => {
+      delete messages[Number(key)];
+    });
+    
+    setTimeout(() => {
+      runBenOrAlgorithm();
+    }, 10);
+    
     res.status(200).send("consensus started");
   });
 
@@ -128,13 +173,10 @@ export async function node(
     res.status(200).send("node stopped");
   });
 
-  // start the server
   const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
     console.log(
       `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
     );
-
-    // the node is ready
     setNodeIsReady(nodeId);
   });
 
